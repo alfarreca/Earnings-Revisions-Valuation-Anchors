@@ -3,10 +3,16 @@ import pandas as pd
 import numpy as np
 import io
 from datetime import datetime
-import yfinance as yf
 
 st.set_page_config(page_title="Revisions & Valuation — XLSX Workflow",
                    page_icon="📈", layout="wide")
+
+# ---------- optional price fetch (guard yfinance) ----------
+try:
+    import yfinance as yf
+    YF_OK = True
+except Exception:
+    YF_OK = False
 
 # ---------- Exchange → Yahoo suffix helpers ----------
 EXCHANGE_SUFFIX = {
@@ -45,9 +51,9 @@ def infer_yf_symbol(symbol: str, exchange: str) -> str:
     suff = EXCHANGE_SUFFIX.get(str(exchange).strip(), "")
     return f"{symbol.strip()}{suff}"
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_price(yf_symbol: str):
-    if not yf_symbol:
+    if not (YF_OK and yf_symbol):
         return None
     try:
         t = yf.Ticker(yf_symbol)
@@ -91,27 +97,27 @@ def to_excel_bytes(df_dict: dict) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         for sheet, data in df_dict.items():
-            if isinstance(data, pd.DataFrame) and not data.empty:
-                data.to_excel(writer, index=False, sheet_name=sheet[:31])
-            else:
-                pd.DataFrame().to_excel(writer, index=False, sheet_name=sheet[:31])
+            (data if isinstance(data, pd.DataFrame) else pd.DataFrame()
+             ).to_excel(writer, index=False, sheet_name=sheet[:31])
     return output.getvalue()
 
-# ---------- Sidebar ----------
+# ---------- UI ----------
+st.title("📈 Revisions & Valuation — Upload XLSX and Analyze")
+st.success("App loaded ✔️  Upload your XLSX to begin.")
+st.write("Expected columns: **Symbol, Exchange, Name, Sector, Industry, Country, Asset_Type, Notes**. "
+         "App derives **YF_Symbol**; you fill **EPS forward** & **5Y median P/E**; then it computes "
+         "**Revision %**, **Forward P/E**, **PE discount** and a **Flag**.")
+
 with st.sidebar:
-    st.title("📈 Revisions & Valuation (XLSX)")
-    st.caption("Upload your XLSX with: Symbol, Exchange, Name, Sector, Industry, Country, Asset_Type, Notes")
-    st.markdown("---")
-    fetch_prices = st.checkbox("Fetch live prices (yfinance)", value=True)
+    st.header("Options")
+    fetch_prices = st.checkbox("Fetch live prices (yfinance)", value=False,
+                               help="Keep off on first run to avoid slow external calls.")
+    if not YF_OK:
+        st.caption("yfinance not available; price fetch disabled.")
     only_attractive = st.checkbox("Show only Attractive", value=False)
     sort_by = st.selectbox("Sort by",
                            ["Revision_% desc", "PE_Discount_% desc", "Forward_PE asc", "Symbol asc"], index=0)
-    st.markdown("---")
     add_timestamp = st.checkbox("Timestamp on export filename", value=True)
-
-st.title("Revisions & Valuation — Upload XLSX and Analyze")
-st.write("Expected columns: **Symbol, Exchange, Name, Sector, Industry, Country, Asset_Type, Notes**. "
-         "App derives **YF_Symbol**, you fill **EPS forward & 5Y median P/E**, app computes **Revision %** & **Forward P/E** and flags.")
 
 up = st.file_uploader("Upload your portfolio XLSX", type=["xlsx"])
 if up is None:
@@ -139,9 +145,7 @@ for col in ["EPS_TTM","EPS_Fwd_FY_Old","EPS_Fwd_FY_New",
         base[col] = np.nan
 
 st.subheader("Step 1 — Review mapping & fill EPS/anchors")
-st.caption("Check **YF_Symbol** mapping; override if needed (e.g., 2B76.DE, RBOT.L). "
-           "Then fill **EPS_Fwd_FY_Old/New** and **FiveY_Median_PE**. "
-           "TTM/Next Q are optional.")
+st.caption("Check **YF_Symbol** (override if needed, e.g., 2B76.DE / RBOT.L). Then fill **EPS_Fwd_FY_Old/New** and **FiveY_Median_PE**.")
 edited = st.data_editor(
     base,
     num_rows="dynamic",
@@ -157,8 +161,8 @@ edited = st.data_editor(
     },
 )
 
-# Fetch prices if requested
-if fetch_prices:
+# Fetch prices only if requested & yfinance available
+if fetch_prices and YF_OK:
     with st.status("Fetching prices from yfinance...", expanded=False):
         prices = []
         for yf_sym, cur_p in zip(edited["YF_Symbol"].astype(str), edited["Price"]):
@@ -194,18 +198,26 @@ st.dataframe(signals, use_container_width=True, height=420)
 st.subheader("Step 3 — Snapshot")
 if not signals.empty:
     top = signals.head(10).copy()
-    good = (signals["Flag"] == "Attractive").sum()
+    good = int((signals["Flag"] == "Attractive").sum())
     st.write(f"**Attractive candidates:** {good} / {len(signals)}")
     st.dataframe(top[["Symbol","Name","Revision_%","Forward_PE",
-                      "FiveY_Median_PE","PE_Discount_%","Flag"]], use_container_width=True)
+                      "FiveY_Median_PE","PE_Discount_%","Flag"]],
+                 use_container_width=True)
 
 # ---------- Export ----------
 st.subheader("Step 4 — Export Excel")
 ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S") if add_timestamp else ""
 fname = f"Revisions_Valuation_withSignals_{ts}.xlsx" if ts else "Revisions_Valuation_withSignals.xlsx"
+def to_excel_bytes(df_dict: dict) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        for sheet, data in df_dict.items():
+            (data if isinstance(data, pd.DataFrame) else pd.DataFrame()
+             ).to_excel(writer, index=False, sheet_name=sheet[:31])
+    return output.getvalue()
 xls = to_excel_bytes({"Signals": signals, "Inputs": edited})
 st.download_button("📥 Download workbook", data=xls, file_name=fname,
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 st.markdown("---")
-st.caption("Tip: keep your XLSX as the single source of truth. Update EPS forward after earnings/guidance; the app will flag changes automatically.")
+st.caption("Tip: keep your XLSX as the source of truth. Update EPS forward after earnings/guidance; the app flags changes.")
