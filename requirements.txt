@@ -1,5 +1,8 @@
-streamlit==1.33.0
-pandas==2.2.2
-yfinance==0.2.44
-numpy==1.26.4
-xlsxwriter==3.2.0
+streamlit
+pandas
+numpy
+plotly
+yfinance
+openpyxl
+requests
+python-dotenv
