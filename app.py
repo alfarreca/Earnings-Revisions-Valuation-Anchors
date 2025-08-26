@@ -1,5 +1,6 @@
 # app.py — Earnings Revision Tracker (fixed & hardened)
-# Preserves your UI/flows, adds robust data fetching, caching, and EU exchange support.
+# Preserves your UI/flows, adds robust data fetching, caching, EU exchange support,
+# and fixes duplicate-column errors with pyarrow/Streamlit.
 
 import streamlit as st
 import pandas as pd
@@ -152,7 +153,7 @@ def _fetch_ticker_payload(full_symbol: str):
     try:
         q = t.quarterly_earnings  # columns: Revenue, Earnings
         if isinstance(q, pd.DataFrame) and not q.empty and "Earnings" in q.columns:
-            q_earn = q["Earnings"].sort_index()  # ascending by quarter
+            q_earn = q["Earnings"].sort_index()
     except Exception:
         q_earn = None
 
@@ -234,10 +235,13 @@ class EarningsRevisionTracker:
         expected = ["Exchange", "Name", "Sector", "Industry", "Country", "Asset_Type", "Notes"]
         df = _ensure_columns(df, expected)
 
-        # Normalize/parse input symbol & exchange (supports 'EXCH:SYMBOL' input)
+        # Always rebuild YF_Symbol from Symbol+Exchange to guarantee a single column
         df["YF_Symbol"] = df.apply(
             lambda r: _parse_symbol_and_exchange(r["Symbol"], r["Exchange"]), axis=1
         )
+
+        # Ensure unique column names at the source
+        df = df.loc[:, ~df.columns.duplicated()]
 
         self.df = df
         st.success(f"Successfully loaded {len(self.df)} rows")
@@ -259,7 +263,6 @@ class EarningsRevisionTracker:
                 "PE_5Y_Median": None,
                 "Valuation_Premium_Pct": None,
                 "Data_Status": "Error",
-                "YF_Symbol": full_symbol,
             })
 
         # Revision proxy from net income series
@@ -276,6 +279,7 @@ class EarningsRevisionTracker:
         if data.get("forward_pe") is not None and pe_5y not in (None, 0):
             val_prem = (data["forward_pe"] - pe_5y) / pe_5y
 
+        # NOTE: We intentionally DO NOT return YF_Symbol here to avoid duplicates on concat
         return pd.Series({
             "Current_EPS_TTM": data.get("current_eps"),
             "Forward_EPS": data.get("forward_eps"),
@@ -286,7 +290,6 @@ class EarningsRevisionTracker:
             "PE_5Y_Median": pe_5y,
             "Valuation_Premium_Pct": val_prem,
             "Data_Status": "Success",
-            "YF_Symbol": full_symbol,
         })
 
     def analyze_portfolio(self, max_rows=None):
@@ -310,14 +313,23 @@ class EarningsRevisionTracker:
             results.append(result)
             progress_bar.progress(i / len(df))
 
-        self.analysis_results = pd.concat([df.reset_index(drop=True),
-                                           pd.DataFrame(results).reset_index(drop=True)], axis=1)
+        self.analysis_results = pd.concat(
+            [df.reset_index(drop=True), pd.DataFrame(results).reset_index(drop=True)],
+            axis=1
+        )
+
+        # Ensure unique columns after concat (fixes pyarrow duplicate-column error)
+        self.analysis_results = self.analysis_results.loc[:, ~self.analysis_results.columns.duplicated()]
+
         st.success("Analysis complete!")
 
     def display_results(self):
         """Display metrics, filters, table, charts, and top picks."""
         if self.analysis_results is None or self.analysis_results.empty:
             return
+
+        # One more safety: ensure unique columns before any rendering
+        self.analysis_results = self.analysis_results.loc[:, ~self.analysis_results.columns.duplicated()]
 
         # Summary metrics
         col1, col2, col3, col4 = st.columns(4)
@@ -343,12 +355,17 @@ class EarningsRevisionTracker:
         with c2:
             max_pe_premium = st.slider("Max PE Premium %", -1.0, 2.0, 2.0, 0.05)
         with c3:
-            sectors = st.multiselect("Sectors", sorted([s for s in self.analysis_results["Sector"].dropna().unique() if s != ""]))
+            sectors = st.multiselect(
+                "Sectors",
+                sorted([s for s in self.analysis_results["Sector"].dropna().unique() if s != ""])
+            )
         with c4:
             show_only_success = st.checkbox("Only successful rows", True)
 
         # Apply filters
         filtered = self.analysis_results.copy()
+        filtered = filtered.loc[:, ~filtered.columns.duplicated()]  # ensure unique col names
+
         if show_only_success:
             filtered = filtered[filtered["Data_Status"] == "Success"]
 
@@ -370,6 +387,9 @@ class EarningsRevisionTracker:
         for c in display_cols:
             if c not in filtered.columns:
                 filtered[c] = np.nan
+
+        # One more guard before view
+        filtered = filtered.loc[:, ~filtered.columns.duplicated()]
 
         table_df = filtered[display_cols].copy()
 
